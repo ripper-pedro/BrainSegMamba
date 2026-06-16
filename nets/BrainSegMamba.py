@@ -118,16 +118,18 @@ class HybridConvMambaEncoder(nn.Module):
     def forward(self, x):
         x = self.stem(x)
         skips = []
-        for stage, mamba in zip(self.stages, self.mamba_layers):
+        for stage, mamba_skip in zip(self.stages, self.mamba_layers):
             x = stage(x)
             # Optional: Enable gradient checkpointing for VRAM optimization (training takes longer).
             # x = checkpoint(stage, x, use_reentrant=False)
 
-            if not isinstance(mamba, nn.Identity):
-                x = mamba(x)
-                # x = checkpoint(mamba, x, use_reentrant=False)
+            if not isinstance(mamba_skip, nn.Identity):
+                feature_to_skip = mamba_skip(x)
+                # feature_to_skip =  checkpoint(mamba_skip, x, use_reentrant=False)
+            else:
+                feature_to_skip = x
             
-            skips.append(x)
+            skips.append(feature_to_skip)
 
         return skips
 
@@ -214,16 +216,18 @@ class PureMambaEncoder(nn.Module):
     def forward(self, x):
         x = self.stem(x)
         skips = []
-        for stage, mamba in zip(self.stages, self.mamba_layers):
+        for stage, mamba_skip in zip(self.stages, self.mamba_layers):
             x = stage(x)
             # Optional: Enable gradient checkpointing for VRAM optimization (training takes longer).
             # x = checkpoint(stage, x, use_reentrant=False)
 
-            if not isinstance(mamba, nn.Identity):
-                x = mamba(x)
-                # x = checkpoint(mamba, x, use_reentrant=False)
+            if not isinstance(mamba_skip, nn.Identity):
+                feature_to_skip = mamba_skip(x)
+                # feature_to_skip =  checkpoint(mamba_skip, x, use_reentrant=False)
+            else:
+                feature_to_skip = x
             
-            skips.append(x)
+            skips.append(feature_to_skip)
 
         return skips
 
@@ -297,9 +301,11 @@ class HeavyDecoder(nn.Module):
         decoder_channel_sizes: Target channel dimensions for upsampling stages.
         encoder_channel_sizes: Channel dimensions expected from skip connections.
         num_convs_per_stage: Number of ResidualBlocks applied after fusion.
-        deep_supervision: Enables multi-scale topological loss. Routes from
-            SDI outputs if skip_type='sdi', otherwise routes from decoder stages.
-        use_vss_in_decoder: If True, injects a VSSLayer3D block at each stage.
+        decoder_mamba_depths: Number of VSSLayer3D blocks applied if the stage is Mamba-based.
+            # NOTE: Accessed in reverse order [i - 1] during bottom-up construction.
+        down_type: List indicating the architectural paradigm ("residual", "mamba", etc) per stage.
+            # NOTE: Accessed in reverse order [i - 1] during bottom-up construction.
+        deep_supervision: Enables multi-scale topological loss.
         mamba_kwargs: Dictionary containing state-space specific parameters.
         **kwargs: nnU-Net dependency injections.
     """
@@ -309,11 +315,12 @@ class HeavyDecoder(nn.Module):
                  decoder_channel_sizes: List[int],
                  encoder_channel_sizes: List[int],
                  num_convs_per_stage: List[int],
+                 decoder_mamba_depths: List[int],
+                 down_type: List[str],
                  stage_sizes: List[int],
                  stem_patch_size: int,
-                 deep_supervision: bool = False,
-                 use_vss_in_decoder: bool = False,
-                 mamba_kwargs: dict = None,
+                 deep_supervision: bool,
+                 mamba_kwargs: dict,
                  **kwargs):
         super().__init__()
 
@@ -333,6 +340,7 @@ class HeavyDecoder(nn.Module):
             dec_out_ch = decoder_channel_sizes[i - 1]
             skip_ch = encoder_channel_sizes[i - 1]
             current_size = stage_sizes[i - 1]
+            stage_type = down_type[i - 1]
 
             # UpConv naturally halves the channels: dec_in_ch -> dec_out_ch
             self.upsamples.append(UpConv(
@@ -358,23 +366,25 @@ class HeavyDecoder(nn.Module):
                 **kwargs
             ))
 
-            # Subsequent smoothing blocks
-            for _ in range(max(0, num_convs_per_stage[i - 1] - 1)):
-                stage_blocks.append(ResidualBlock(
-                    input_channels=dec_out_ch,
-                    output_channels=dec_out_ch,
-                    **kwargs
-                ))
+            if stage_type == "mamba": 
+                # Dynamically instantiate Mamba layers based on the specified depths
+                mamba_depth = decoder_mamba_depths[i - 1]
+                if mamba_depth > 0:
+                    mamba_kwargs = mamba_kwargs or {}
+                    stage_blocks.append(MambaWrapper(VSSLayer3D(
+                        dim=dec_out_ch,
+                        depth=mamba_depth,
+                        size=current_size,
+                        **mamba_kwargs
+                    )))
+            else:
+                for _ in range(max(0, num_convs_per_stage[i - 1] - 1)):
+                    stage_blocks.append(ResidualBlock(
+                        input_channels=dec_out_ch,
+                        output_channels=dec_out_ch,
+                        **kwargs
+                    ))
             
-            if use_vss_in_decoder:
-                mamba_kwargs = mamba_kwargs or {}
-                stage_blocks.append(MambaWrapper(VSSLayer3D(
-                    dim=dec_out_ch,
-                    depth=1,
-                    size=current_size,
-                    **mamba_kwargs
-                )))
-                
             self.stages.append(nn.Sequential(*stage_blocks))
 
             # Unified geometric DS heads mapped to each decoder scale output
@@ -419,8 +429,9 @@ class HeavyDecoder(nn.Module):
             x = stage(x)
 
             # Collect spatial intermediate maps from the heavy decoder blocks
-            if self.deep_supervision and i < len(self.stages) - 1:
-                decoder_ds.append(self.seg_layers[i](x))
+            if self.deep_supervision:
+                if len(self.final_ups) > 0 or i < len(self.stages) - 1:
+                    decoder_ds.append(self.seg_layers[i](x))
 
         # Process the learnable final cascade to full input size
         cascade_ds = []
@@ -445,6 +456,8 @@ class LightDecoder(nn.Module):
         num_classes: Number of output segmentation classes.
         decoder_channel_sizes: Target channel dimensions for upsampling stages.
         encoder_channel_sizes: Channel dimensions expected from skip connections.
+        decoder_mamba_depths: List indicating the VSSLayer3D depth per decoder stage.
+            # NOTE: Accessed in reverse order [i - 1] during bottom-up construction.
         deep_supervision: If True, enables multi-scale loss extraction.
         **kwargs: nnU-Net dependency injections.
     """
@@ -453,8 +466,11 @@ class LightDecoder(nn.Module):
                  num_classes: int,
                  decoder_channel_sizes: List[int],
                  encoder_channel_sizes: List[int],
-                 deep_supervision: bool,
+                 decoder_mamba_depths: List[int],
+                 stage_sizes: List[int],
                  stem_patch_size: int,
+                 deep_supervision: bool,
+                 mamba_kwargs: dict = None,
                  **kwargs):
         super().__init__()
 
@@ -477,6 +493,7 @@ class LightDecoder(nn.Module):
             dec_in_ch = decoder_channel_sizes[i]
             dec_out_ch = decoder_channel_sizes[i - 1]
             skip_ch = encoder_channel_sizes[i - 1]
+            current_size = stage_sizes[i - 1]
             
             if self.upsample_type == "transpose":
                 self.upsamples.append(UpConv(
@@ -497,15 +514,28 @@ class LightDecoder(nn.Module):
             else:
                 raise ValueError(f"Unsupported skip type: {self.skip_type}")
                 
+            stage_blocks = []
+            
             # 1x1 conv to fuse and project to the next stage's channel size
-            fusion_conv = conv_op(
+            stage_blocks.append(conv_op(
                 in_channels=fusion_in_ch, 
                 out_channels=dec_out_ch, 
                 kernel_size=1, 
                 bias=False
-            )
+            ))
+
+            # Dynamically instantiate Mamba layers based on the specified depths
+            mamba_depth = decoder_mamba_depths[i - 1]
+            if mamba_depth > 0:
+                mamba_kwargs = mamba_kwargs or {}
+                stage_blocks.append(MambaWrapper(VSSLayer3D(
+                    dim=dec_out_ch,
+                    depth=mamba_depth,
+                    size=current_size,
+                    **mamba_kwargs
+                )))
             
-            self.stages.append(nn.Sequential(fusion_conv))
+            self.stages.append(nn.Sequential(*stage_blocks))
 
             # Geometric heads based on output channels for each state
             self.ds_heads.append(conv_op(dec_out_ch, num_classes, kernel_size=1))
@@ -553,8 +583,9 @@ class LightDecoder(nn.Module):
             x = stage(x)
 
             # Stores intermediate resolutions of the decoder (smaller to larger)
-            if self.deep_supervision and i < len(self.stages) - 1:
-                decoder_ds.append(self.ds_heads[i](x))
+            if self.deep_supervision:
+                if len(self.final_ups) > 0 or i < len(self.stages) - 1:
+                    decoder_ds.append(self.ds_heads[i](x))
 
         # Execution of the final learnable cascade towards the ground truth
         cascade_ds = []
@@ -733,6 +764,7 @@ class BrainSegMamba(nn.Module):
                  down_type: List[str],
                  num_convs_per_stage: List[int],
                  skip_mamba_depths: List[int],
+                 decoder_mamba_depths: List[int],
                  bottleneck_depth: int,
                  embedding_dim: int,
                  img_dim: int,
@@ -754,6 +786,8 @@ class BrainSegMamba(nn.Module):
             raise ValueError("num_convs_per_stage must have the same length as encoder_channel_sizes!")
         if len(encoder_channel_sizes) != len(skip_mamba_depths):
             raise ValueError("skip_mamba_depths must have the same length as encoder_channel_sizes!")
+        if len(encoder_channel_sizes) != len(decoder_mamba_depths):
+            raise ValueError("decoder_mamba_depths must have the same length as encoder_channel_sizes!")
 
         if skip_type in ["sdi", "sum", "concat"] and any(d > 0 for d in skip_mamba_depths):
             warnings.warn(
@@ -761,6 +795,12 @@ class BrainSegMamba(nn.Module):
                 "If you wanted Mamba skips, set skip_type='mamba'."
             )
             skip_mamba_depths = [0] * len(skip_mamba_depths)
+        if encoder_type == "pure_mamba" and any(d != "mamba" for d in down_type):
+            warnings.warn(
+                f"encoder_type='pure_mamba' overrides down_type. All stages will use 'mamba' downsampling. "
+                f"Your input down_type={down_type} will be ignored."
+            )
+            down_type = ["mamba"] * len(down_type)
             
         self.skip_type = skip_type
         self.encoder_type = encoder_type
@@ -870,22 +910,25 @@ class BrainSegMamba(nn.Module):
                 num_classes=num_classes,
                 decoder_channel_sizes=decoder_channel_sizes,
                 encoder_channel_sizes=effective_skip_sizes,
+                decoder_mamba_depths=decoder_mamba_depths,
+                stage_sizes=stage_sizes,
                 deep_supervision=deep_supervision,
                 stem_patch_size=self.stem_reduces_by,
+                mamba_kwargs=mamba_kwargs,
                 **block_kwargs
             )
         elif decoder_type == "heavy":
-            self.use_vss_in_decoder = network_kwargs["use_vss_in_decoder"]
             self.decoder = HeavyDecoder( 
                 skip_type,
                 num_classes=num_classes,
                 decoder_channel_sizes=decoder_channel_sizes,
                 encoder_channel_sizes=effective_skip_sizes,
                 num_convs_per_stage=num_convs_per_stage,
+                decoder_mamba_depths=decoder_mamba_depths,
+                down_type=down_type,
                 stage_sizes=stage_sizes,
                 stem_patch_size=self.stem_reduces_by,
                 deep_supervision=deep_supervision,
-                use_vss_in_decoder=self.use_vss_in_decoder,
                 mamba_kwargs=mamba_kwargs,
                 **block_kwargs
             )
