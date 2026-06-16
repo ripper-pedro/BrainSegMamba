@@ -12,7 +12,7 @@ Recommended Configurations (Architecture Profiles):
     - decoder_type: "light"
     - bottleneck_depth: 0
     - skip_type: "sdi"
-    - enable_deep_supervision: True (Extracts logits directly from SDI)
+    - enable_deep_supervision: True
     - upsample_type: "transpose"
     - stem_patch_size: 2 (Crucial for VRAM stability in 3D pure mamba)
     - norm_type: "ln" (LayerNorm)
@@ -51,9 +51,9 @@ class nnUNetTrainerBrainSegMamba(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
-        self.initial_lr = 1e-3
+        self.initial_lr = 1e-4
         self.weight_decay = 1e-2
-        self.num_epochs = 800
+        self.num_epochs = 1000
         self.batch_size = 1 # Must be 1 for "pure_mamba" encoder to prevent OOM
         self.enable_deep_supervision = True
 
@@ -94,6 +94,10 @@ class nnUNetTrainerBrainSegMamba(nnUNetTrainer):
         skip_mamba_depths:
             List of VSSLayer3D block depths applied at each skip connection.
             Is set to [0, 0, ...] if skip_type is not "mamba".
+        decoder_mamba_depths:
+            List of VSSLayer3D block depths applied per stage in the expansive path (Decoder).
+            Indexed from shallowest (high-res) to deepest (low-res) by reading the list in reverse order when applying.
+            For the heavy_decoder, it follows the "down_type" list (also in reverse order) to apply either a mamba block or a residual block.
         num_stages:
             Number of stages in the network.
         down_type (per stage):
@@ -178,13 +182,14 @@ class nnUNetTrainerBrainSegMamba(nnUNetTrainer):
         decoder_type = "light" 
         
         skip_type = "sdi"
-        skip_mamba_depths = [0, 0, 0, 0, 0]
+        skip_mamba_depths = [0, 0, 1, 1, 1] # Doesn't change anything if "skip_type" is not "mamba"
         
         num_convs_per_stage = [2, 3, 4, 4, 8]
         num_stages = len(num_convs_per_stage)
         down_type = ["residual", "residual", "residual", "mamba", "mamba"] # Doesn't change anything if "encoder_type" is pure_mamba
 
         bottleneck_depth = 0
+        decoder_mamba_depths = [2, 3, 4, 4, 8]
         
         # CHANNEL AND SIZES PARAMETERIZATION
         stem_patch_size = 2 # Must be >=2 for "pure_mamba" encoder to prevent OOM
@@ -209,7 +214,6 @@ class nnUNetTrainerBrainSegMamba(nnUNetTrainer):
         network_kwargs['preact'] = True # Used in the ResidualBlock
         network_kwargs['id'] = True # Used in the ResidualBlock
         network_kwargs['sdi_expand_channels'] = False
-        network_kwargs['use_vss_in_decoder'] = False
         config['network_kwargs'] = network_kwargs
 
         # Mamba / VSSLayer3D Specific Parameters
@@ -261,6 +265,7 @@ class nnUNetTrainerBrainSegMamba(nnUNetTrainer):
             decoder_channel_sizes=decoder_channel_sizes,
             num_convs_per_stage=num_convs_per_stage,
             skip_mamba_depths=skip_mamba_depths,
+            decoder_mamba_depths=decoder_mamba_depths,
             bottleneck_depth=bottleneck_depth,
             embedding_dim=embedding_dim,
             img_dim=img_patch_size,
