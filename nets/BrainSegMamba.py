@@ -334,6 +334,19 @@ class HeavyDecoder(nn.Module):
         self.stages = nn.ModuleList()
         self.seg_layers = nn.ModuleList()
 
+        deepest_mamba_depth = decoder_mamba_depths[-1]
+        if deepest_mamba_depth > 0:
+            mamba_kwargs = mamba_kwargs
+            deepest_size = stage_sizes[-1] 
+            self.deepest_mamba = MambaWrapper(VSSLayer3D(
+                dim=decoder_channel_sizes[-1],
+                depth=deepest_mamba_depth,
+                size=deepest_size,
+                **mamba_kwargs
+            ))
+        else:
+            self.deepest_mamba = nn.Identity()
+        
         # Build decoder stages from deepest to shallowest resolution
         for i in range(len(decoder_channel_sizes) - 1, 0, -1):
             dec_in_ch = decoder_channel_sizes[i]
@@ -412,6 +425,8 @@ class HeavyDecoder(nn.Module):
     def forward(self, x, skips):
         decoder_ds = []
 
+        x = self.deepest_mamba(x)
+
         for i, (up, stage) in enumerate(zip(self.upsamples, self.stages)):
             x = up(x)
             skip = skips[-(i + 1)]
@@ -488,6 +503,19 @@ class LightDecoder(nn.Module):
         if self.upsample_type == "transpose":
             self.upsamples = nn.ModuleList()
         
+        deepest_mamba_depth = decoder_mamba_depths[-1]
+        if deepest_mamba_depth > 0:
+            mamba_kwargs = mamba_kwargs
+            deepest_size = stage_sizes[-1] 
+            self.deepest_mamba = MambaWrapper(VSSLayer3D(
+                dim=decoder_channel_sizes[-1],
+                depth=deepest_mamba_depth,
+                size=deepest_size,
+                **mamba_kwargs
+            ))
+        else:
+            self.deepest_mamba = nn.Identity()
+        
         # Build lightweight stages (bottom-up)
         for i in range(len(decoder_channel_sizes) - 1, 0, -1):
             dec_in_ch = decoder_channel_sizes[i]
@@ -560,6 +588,8 @@ class LightDecoder(nn.Module):
 
     def forward(self, x, skips):
         decoder_ds = []
+
+        x = self.deepest_mamba(x)
         
         for i, (align, stage) in enumerate(zip(self.align_convs, self.stages)):
             skip = skips[-(i + 1)]
@@ -625,10 +655,12 @@ class SDI(nn.Module):
         cbam_kwargs: dict,
         block_kwargs: dict,
         expand_channels: bool = True,
+        fusion_mode: str
     ) -> None:
         super().__init__()
         
         self.expand_channels = expand_channels
+        self.fusion_mode = fusion_mode
 
         conv_op = block_kwargs['conv_op']
         self.num_scales = len(in_channels_list)
@@ -667,6 +699,15 @@ class SDI(nn.Module):
             self.adaptive_pool_func = F.adaptive_avg_pool2d
         else:
             self.adaptive_pool_func = F.adaptive_avg_pool3d
+        
+        if self.fusion_mode == "sigmoid":
+            norm_op = block_kwargs['norm_op']
+            self.attn_norm = norm_op(mid_channel, **block_kwargs['norm_kwargs'])
+            if norm_op is nn.LayerNorm:
+                self.attn_norm = ChannelLastWrapper(self.attn_norm)
+
+        if self.fusion_mode == "concat":
+            self.concat_conv = conv_op(mid_channel * self.num_scales, mid_channel, kernel_size=1, bias=False)
 
     def forward(self, xs: List[torch.Tensor]) -> List[torch.Tensor]:
         processed_xs = []
@@ -689,9 +730,21 @@ class SDI(nn.Module):
                 x = self.smooth_convs[i](x)
                 aligned_features.append(x)
 
-            result = aligned_features[0]
-            for x in aligned_features[1:]:
-                result = result * x
+            if self.fusion_mode == "sigmoid":
+                result = aligned_features[0]
+                for x in aligned_features[1:]:
+                    mask = torch.sigmoid(self.attn_norm(x))
+                    result = result * mask
+
+            elif self.fusion_mode == "sum":
+                result = aligned_features[0]
+                for x in aligned_features[1:]:
+                    result = result + x
+
+            elif self.fusion_mode == "concat":
+                result = torch.cat(aligned_features, dim=1)
+                result = self.concat_conv(result)
+
             if self.expand_channels:
                 result = self.expansions[target_idx](result)
             enriched_skips.append(result)
@@ -806,6 +859,7 @@ class BrainSegMamba(nn.Module):
         self.encoder_type = encoder_type
         self.decoder_type = decoder_type
         self.sdi_expand_channels = network_kwargs["sdi_expand_channels"]
+        self.fusion_mode = network_kwargs["fusion_mode"]
         self.bottleneck_depth = bottleneck_depth
         
         # Determine base spatial reduction from stem configuration.
@@ -882,7 +936,8 @@ class BrainSegMamba(nn.Module):
                 mid_channel=decoder_channel_sizes[0],
                 cbam_kwargs=cbam_kwargs,
                 block_kwargs=block_kwargs,
-                expand_channels=self.sdi_expand_channels
+                expand_channels=self.sdi_expand_channels,
+                fusion_mode=self.fusion_mode
             )
             
             if not self.sdi_expand_channels:
