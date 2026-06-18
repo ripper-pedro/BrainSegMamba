@@ -140,10 +140,30 @@ class nnUNetTrainerBrainSegMamba(nnUNetTrainer):
         id:
             True: Identity mapping in residual blocks.
             False: 1x1 Conv projection in residual blocks.
+        fusion_mode:
+            Mathematical strategy used by the SDI module to fuse multi-scale features:
+            - "sigmoid": Normalizes inputs and applies a Sigmoid attention mask before Hadamard product. Prevents gradient explosion while preserving semantic gating.
+            - "sum": Simple element-wise addition (most stable).
+            - "concat": Concatenates all scales across the channel dimension and compresses them back using a 1x1 convolution.
+        sdi_expand_channels:
+            - True: After fusion, the SDI module projects the features back to their original encoder channel dimensions using 1x1 convolutions.
+            - False: The SDI module maintains the 'mid_channel' width across all output scales, significantly reducing parameters in the decoder.
+
+        [State-Space Models (Mamba)]
+        d_state:
+            The hidden state dimension of the SSM. Typically 16 for deep architectures (like VM-UNet V2) or 64 for lighter hybrid architectures.
+        version:
+            The underlying VSS algorithm version (e.g., "v5").
+        scan_type:
+            The spatial scanning heuristic used to flatten 3D features into 1D sequences (e.g., "scan").
             
-        [SDI & CBAM Constraints]
-        - spatial_kernel_size: Must be an odd number (e.g., 3, 5, 7).
-        - no_spatial and no_channel cannot both be True simultaneously.
+        [Attention (CBAM)]
+        reduction_ratio:
+            The channel reduction factor used in the Channel Attention MLP. Higher values save memory.
+        spatial_kernel_size:
+            Kernel size for spatial attention. Must be an odd number (e.g., 3, 5, 7).
+        no_spatial / no_channel:
+            If True, disables the respective attention branch. Cannot both be True simultaneously.
         """
         
         # =====================================================================
@@ -214,6 +234,7 @@ class nnUNetTrainerBrainSegMamba(nnUNetTrainer):
         network_kwargs['preact'] = True # Used in the ResidualBlock
         network_kwargs['id'] = True # Used in the ResidualBlock
         network_kwargs['sdi_expand_channels'] = False
+        network_kwargs['fusion_mode'] = "sigmoid"
         config['network_kwargs'] = network_kwargs
 
         # Mamba / VSSLayer3D Specific Parameters
